@@ -64,6 +64,8 @@ class Payment extends \Magento\Payment\Model\Method\Cc
     protected $save_cc;
     protected $installments;
     protected $iva = 0;
+    protected $minimum_amounts = 0;
+    protected $config_months;
 
     /**
      * @var Customer
@@ -150,7 +152,14 @@ class Payment extends \Magento\Payment\Model\Method\Cc
         $this->iva = $this->country === 'CO' ? $this->getConfigData('iva') : '0';
         $this->save_cc = $this->getConfigData('save_cc');
         $this->installments = $this->country === 'CO' ? $this->getConfigData('installments') : '1';
-        //$this->minimum_amount = $this->getConfigData('minimum_amount');
+        $this->minimum_amounts = $this->getConfigData('minimum_amounts');
+        $this->config_months = $this->minimum_amounts ? array(
+                                        "3" => $this->getConfigData('three_months'),
+                                        "6" => $this->getConfigData('six_months'),
+                                        "9" => $this->getConfigData('nine_months'),
+                                        "12" => $this->getConfigData('twelve_months'),
+                                        "18" => $this->getConfigData('eighteen_months')
+        ) : null;
         
         $this->openpay = $openpay;
     }
@@ -552,6 +561,11 @@ class Payment extends \Magento\Payment\Model\Method\Cc
             }            
             
             $openpay_customer = $this->getOpenpayCustomer($customer_id);
+            if($openpay_customer === false){
+                $openpay = $this->getOpenpayInstance();
+                return $openpay->charges->get($charge_id);
+            }
+
             return $openpay_customer->charges->get($charge_id);            
         } catch (\Exception $e) {
             throw new \Magento\Framework\Validator\Exception(__($e->getMessage()));
@@ -588,6 +602,17 @@ class Payment extends \Magento\Payment\Model\Method\Cc
                 $openpay_customer_local->addData($data)->save();                    
             } else {
                 $openpay_customer = $this->getOpenpayCustomer($has_openpay_account->openpay_id);
+                if($openpay_customer === false){
+                    $openpay_customer = $this->createOpenpayCustomer($customer_data);
+
+                    $this->logger->debug('#update openpay_customer', array('$openpay_customer_old' => $has_openpay_account->openpay_id, '$openpay_customer_old_new' => $openpay_customer->id));
+
+                    // Se actualiza en BD la relación
+                    $openpay_customer_local = $this->openpayCustomerFactory->create();
+                    $openpay_customer_local_update = $openpay_customer_local->load($has_openpay_account->openpay_customer_id);
+                    $openpay_customer_local_update->setOpenpayId($openpay_customer->id);
+                    $openpay_customer_local_update->save();
+                }
             }
             
             return $openpay_customer;
@@ -608,9 +633,13 @@ class Payment extends \Magento\Payment\Model\Method\Cc
     public function getOpenpayCustomer($openpay_customer_id) {
         try {
             $openpay = $this->getOpenpayInstance();
-            return $openpay->customers->get($openpay_customer_id);            
+            $customer = $openpay->customers->get($openpay_customer_id);
+            if(isset($customer->balance)){
+                return false;
+            }
+            return $customer;            
         } catch (\Exception $e) {
-            throw new \Magento\Framework\Validator\Exception(__($e->getMessage()));
+            return false;
         }        
     }
     
@@ -647,10 +676,14 @@ class Payment extends \Magento\Payment\Model\Method\Cc
         if ($has_openpay_account === false) {
             return array(array('value' => 'new', 'name' => 'Nueva tarjeta'));
         }
-        
+
+        $customer = $this->getOpenpayCustomer($has_openpay_account->openpay_id);
+        if($customer == false){
+            return array(array('value' => 'new', 'name' => 'Nueva tarjeta'));
+        }
+
         try {
             $list = array(array('value' => 'new', 'name' => 'Nueva tarjeta'));
-            $customer = $this->getOpenpayCustomer($has_openpay_account->openpay_id);
             $cards = $this->getCreditCards($customer, $has_openpay_account->created_at);
             
             foreach ($cards as $card) {                
@@ -661,6 +694,11 @@ class Payment extends \Magento\Payment\Model\Method\Cc
         } catch (\Exception $e) {
             throw new \Magento\Framework\Validator\Exception(__($e->getMessage()));
         }        
+    }
+    
+    public function getBaseUrlStore(){
+        $base_url = $this->_storeManager->getStore()->getBaseUrl(\Magento\Framework\UrlInterface::URL_TYPE_WEB);
+        return $base_url;
     }
     
     public function isLoggedIn() {
@@ -732,7 +770,7 @@ class Payment extends \Magento\Payment\Model\Method\Cc
     }
     
     public function getOpenpayInstance() {
-        $openpay = \Openpay::getInstance($this->merchant_id, $this->sk);
+        $openpay = \Openpay::getInstance($this->merchant_id, $this->sk, $this->country);
         \Openpay::setSandboxMode($this->is_sandbox);
         
         $userAgent = "Openpay-MTO2".$this->country."/v2";
@@ -741,8 +779,21 @@ class Payment extends \Magento\Payment\Model\Method\Cc
         return $openpay;
     }
     
-    public function getMonthsInterestFree() {        
-        $months = explode(',', $this->months_interest_free);                  
+    public function getMonthsInterestFree() {
+        $objectManager = \Magento\Framework\App\ObjectManager::getInstance();
+        $cart = $objectManager->get('\Magento\Checkout\Model\Cart'); 
+        $grandTotal = (int) $cart->getQuote()->getGrandTotal();    
+        $months = explode(',', $this->months_interest_free);
+        
+        if($this->minimum_amounts && $this->country == 'MX'){
+            foreach($months as $key => $value){
+                $msi_minimum_amount = (int) $this->config_months[$value];
+                if($grandTotal < $msi_minimum_amount){
+                    unset($months[$key]);
+                }
+            }
+        }
+        
         if(!in_array('1', $months)) {            
             array_unshift($months, '1');
         }        
